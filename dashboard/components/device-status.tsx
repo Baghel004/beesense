@@ -13,7 +13,8 @@ interface DeviceStatusProps {
 export function DeviceStatus({ latestReading, loading }: DeviceStatusProps) {
   const isOnline = (() => {
     if (!latestReading) return false;
-    const d = new Date(latestReading.timestamp.replace(" ", "T"));
+    const ts = latestReading.stored_at || latestReading.timestamp;
+    const d = new Date(ts.replace(" ", "T"));
     if (isNaN(d.getTime())) return false;
     return Date.now() - d.getTime() < 15 * 60 * 1000;
   })();
@@ -36,14 +37,14 @@ export function DeviceStatus({ latestReading, loading }: DeviceStatusProps) {
         <Row label="Device ID" value={getDeviceId()} loading={false} />
         <Row
           label="Last Seen"
-          value={latestReading ? timeAgo(latestReading.timestamp) : "—"}
+          value={latestReading ? timeAgo(latestReading.stored_at || latestReading.timestamp) : "—"}
           loading={loading}
         />
         <Row
           label="Last Recording"
           value={
             latestReading
-              ? formatTimestamp(latestReading.timestamp)
+              ? formatTimestamp(latestReading.stored_at || latestReading.timestamp)
               : "—"
           }
           loading={loading}

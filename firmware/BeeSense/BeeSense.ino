@@ -59,7 +59,6 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 //  GLOBALS
 // ============================================
 DHT dht(DHTPIN, DHTTYPE);
-WiFiClientSecure secureClient;
 
 bool ntpSynced = false;
 uint32_t fileCounter = 0;
@@ -200,26 +199,56 @@ bool uploadWAVToCloud(String filePath) {
   }
 
   size_t fileSize = wavFile.size();
+  logMsg("[CLOUD] File on SD: " + String(fileSize) + " bytes");
+
+  if (fileSize <= 44) {
+    logMsg("[CLOUD] File too small (header only?), skipping.");
+    wavFile.close();
+    return false;
+  }
+
+  uint32_t freeHeap = ESP.getFreeHeap();
+  logMsg("[CLOUD] Free heap: " + String(freeHeap) + " bytes");
+  if (freeHeap < 60000) {
+    logMsg("[CLOUD] Not enough memory for TLS upload, skipping.");
+    wavFile.close();
+    return false;
+  }
+
   String filename = filePath;
   if (filename.startsWith("/")) filename = filename.substring(1);
 
   String url = String(API_ENDPOINT) + "/api/upload/" + filename;
 
+  WiFiClientSecure *client = new WiFiClientSecure();
+  if (!client) {
+    logMsg("[CLOUD] TLS client alloc failed.");
+    wavFile.close();
+    return false;
+  }
+  client->setInsecure();
+  client->setTimeout(30);
+
   HTTPClient http;
-  http.begin(secureClient, url);
+  http.begin(*client, url);
   http.addHeader("Authorization", "Bearer " + String(API_KEY));
   http.addHeader("Content-Type", "audio/wav");
   http.addHeader("X-Device-Id", String(DEVICE_ID));
   http.setTimeout(120000);
 
-  logMsg("[CLOUD] Uploading " + filename + " (" + String(fileSize / 1024) + " KB)...");
+  logMsg("[CLOUD] Uploading " + filename + " (" + String(fileSize) + " bytes)...");
 
   int httpCode = http.sendRequest("PUT", &wavFile, fileSize);
+
   wavFile.close();
   http.end();
+  client->stop();
+  delete client;
+
+  logMsg("[CLOUD] Free heap after upload: " + String(ESP.getFreeHeap()));
 
   if (httpCode == 200 || httpCode == 201) {
-    logMsg("[CLOUD] WAV upload OK.");
+    logMsg("[CLOUD] WAV upload OK (" + String(httpCode) + ").");
     return true;
   }
 
@@ -234,8 +263,23 @@ bool uploadSensorData(String timestamp, float temp, float humidity,
     return false;
   }
 
+  uint32_t freeHeap = ESP.getFreeHeap();
+  logMsg("[CLOUD] Sensor upload — heap: " + String(freeHeap));
+  if (freeHeap < 50000) {
+    logMsg("[CLOUD] Low memory, skipping sensor upload.");
+    return false;
+  }
+
+  WiFiClientSecure *client = new WiFiClientSecure();
+  if (!client) {
+    logMsg("[CLOUD] TLS client alloc failed.");
+    return false;
+  }
+  client->setInsecure();
+  client->setTimeout(15);
+
   HTTPClient http;
-  http.begin(secureClient, String(API_ENDPOINT) + "/api/sensor-data");
+  http.begin(*client, String(API_ENDPOINT) + "/api/sensor-data");
   http.addHeader("Authorization", "Bearer " + String(API_KEY));
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(15000);
@@ -250,7 +294,10 @@ bool uploadSensorData(String timestamp, float temp, float humidity,
   json += "}";
 
   int httpCode = http.POST(json);
+
   http.end();
+  client->stop();
+  delete client;
 
   if (httpCode == 200 || httpCode == 201) {
     logMsg("[CLOUD] Sensor data uploaded.");
@@ -466,64 +513,48 @@ void recordSession() {
     }
   }
 
-  File wav = SD.open(wavPath.c_str(), FILE_WRITE);
-  if (!wav) {
-    logMsg("[ERROR] Cannot create WAV. Trying SD reinit...");
+  // Record raw audio to temp file (no WAV header — avoids seek/rewrite)
+  File raw = SD.open("/temp.raw", FILE_WRITE);
+  if (!raw) {
+    logMsg("[ERROR] Cannot create temp file. Trying SD reinit...");
     if (reinitSD()) {
-      wav = SD.open(wavPath.c_str(), FILE_WRITE);
+      raw = SD.open("/temp.raw", FILE_WRITE);
     }
-    if (!wav) {
-      logMsg("[ERROR] WAV creation failed after reinit.");
+    if (!raw) {
+      logMsg("[ERROR] Temp file creation failed.");
       return;
     }
   }
 
-  // Write placeholder header (will be updated after recording with actual values)
-  writeWAVHeader(wav, EXPECTED_DATA_BYTES, SAMPLE_RATE);
-  if (wav.position() != 44) {
-    logMsg("[ERROR] Header write failed!");
-    wav.close();
-    return;
-  }
-  logMsg("[OK] WAV file created.");
-
-  // Start I2S
   i2sStart();
 
   uint32_t totalBytes = 0;
   uint32_t writeCount = 0;
   uint32_t writeErrors = 0;
+  uint32_t i2sErrors = 0;
+  uint32_t i2sZeroReads = 0;
 
   unsigned long recordStart = millis();
   unsigned long lastLog = recordStart;
 
   logMsg("[REC] Capturing " + String(RECORD_SECONDS) + " seconds of audio...");
+  logMsg("[REC] Free heap: " + String(ESP.getFreeHeap()));
 
-  // ========================
-  //  MAIN RECORDING LOOP
-  //  Pure audio capture — no DHT, no WiFi, no flush.
-  //  These operations block for hundreds of milliseconds and cause
-  //  I2S DMA buffer overflow, losing audio samples.
-  // ========================
   while ((millis() - recordStart) < ((unsigned long)RECORD_SECONDS * 1000UL)) {
-
     size_t bytesRead = 0;
     esp_err_t err = i2s_read(I2S_NUM_0, i2sRawBuf, I2S_READ_BYTES, &bytesRead, pdMS_TO_TICKS(500));
 
-    if (err != ESP_OK || bytesRead == 0) {
-      continue;
-    }
+    if (err != ESP_OK) { i2sErrors++; continue; }
+    if (bytesRead == 0) { i2sZeroReads++; continue; }
 
-    // Convert raw ADC to signed 16-bit PCM
     int samplesRead = bytesRead / 2;
     for (int i = 0; i < samplesRead; i++) {
       uint16_t adcVal = i2sRawBuf[i] & 0x0FFF;
       pcmBuf[i] = (int16_t)((adcVal - 2048) << 4);
     }
 
-    // Write to SD
     size_t pcmBytes = samplesRead * 2;
-    size_t written = sdWriteWithRetry(wav, (uint8_t*)pcmBuf, pcmBytes);
+    size_t written = sdWriteWithRetry(raw, (uint8_t*)pcmBuf, pcmBytes);
     totalBytes += written;
     writeCount++;
     if (written != pcmBytes) {
@@ -533,45 +564,77 @@ void recordSession() {
       }
     }
 
-    // Brief progress every ~15 seconds (Serial.println is fast, no DMA risk)
     unsigned long now = millis();
     if ((now - lastLog) >= 15000) {
       unsigned long sec = (now - recordStart) / 1000;
       logMsg("[REC] " + String(sec) + "s/" + String(RECORD_SECONDS) +
-             "s | " + String(totalBytes / 1024) + " KB | Err: " + String(writeErrors));
+             "s | " + String(totalBytes) + " bytes | WrErr:" + String(writeErrors));
       lastLog = now;
     }
   }
 
-  // Stop I2S
   i2sStop();
 
   unsigned long recordDuration = millis() - recordStart;
 
+  raw.flush();
+  raw.close();
+
+  logMsg("[REC] Done. Bytes: " + String(totalBytes) + " | Writes: " + String(writeCount) +
+         " | WrErr: " + String(writeErrors) + " | I2SErr: " + String(i2sErrors) +
+         " | Time: " + String(recordDuration / 1000) + "s");
+
   if (totalBytes == 0) {
     logMsg("[ERROR] No audio data captured!");
-    wav.close();
-    SD.remove(wavPath.c_str());
+    SD.remove("/temp.raw");
     return;
   }
 
-  // Compute actual sample rate from the data we captured.
-  // If I2S delivered more or fewer samples than expected, this ensures
-  // the WAV plays back at real-time speed (60s of audio = 60s playback).
+  // Compute actual sample rate so WAV plays back at exactly 60 seconds
   uint32_t actualSampleRate = totalBytes / 2 / RECORD_SECONDS;
   if (actualSampleRate < 1000) actualSampleRate = SAMPLE_RATE;
 
-  logMsg("[REC] Captured " + String(totalBytes) + " bytes in " +
-         String(recordDuration / 1000) + "s");
-  logMsg("[REC] Effective sample rate: " + String(actualSampleRate) +
-         " Hz (configured: " + String(SAMPLE_RATE) + " Hz)");
+  logMsg("[REC] Actual sample rate: " + String(actualSampleRate) + " Hz");
 
-  // Rewrite WAV header with actual data size and computed sample rate
-  wav.seek(0);
+  // Build final WAV: correct header + copy raw data (no seek needed)
+  File wav = SD.open(wavPath.c_str(), FILE_WRITE);
+  if (!wav) {
+    logMsg("[ERROR] Cannot create WAV file.");
+    SD.remove("/temp.raw");
+    return;
+  }
+
   writeWAVHeader(wav, totalBytes, actualSampleRate);
+  if (wav.position() != 44) {
+    logMsg("[ERROR] Header write failed!");
+    wav.close();
+    SD.remove("/temp.raw");
+    return;
+  }
 
+  raw = SD.open("/temp.raw", FILE_READ);
+  if (!raw) {
+    logMsg("[ERROR] Cannot reopen temp file for copy.");
+    wav.close();
+    SD.remove("/temp.raw");
+    return;
+  }
+
+  uint32_t copied = 0;
+  while (raw.available()) {
+    size_t n = raw.read((uint8_t*)i2sRawBuf, I2S_READ_BYTES);
+    if (n > 0) {
+      wav.write((uint8_t*)i2sRawBuf, n);
+      copied += n;
+    }
+  }
+  raw.close();
   wav.flush();
   wav.close();
+  SD.remove("/temp.raw");
+
+  logMsg("[WAV] Built: header(44) + data(" + String(copied) + ") = " +
+         String(copied + 44) + " bytes");
 
   // Verify
   File verify = SD.open(wavPath.c_str(), FILE_READ);
@@ -581,8 +644,7 @@ void recordSession() {
     size_t expected = totalBytes + 44;
     if (fsize >= expected) {
       logMsg("[VERIFY] OK! " + String(fsize) + " bytes (" +
-             String(RECORD_SECONDS) + "s audio at " +
-             String(actualSampleRate) + " Hz).");
+             String(RECORD_SECONDS) + "s at " + String(actualSampleRate) + " Hz).");
     } else {
       logMsg("[VERIFY] Size mismatch: " + String(fsize) + " / " + String(expected));
     }
@@ -617,7 +679,7 @@ void recordSession() {
   lastRecFile = wavPath;
   lastRecTime = ts;
 
-  // Upload to cloud (file stays on SD card regardless of upload result)
+  // Upload to cloud
   bool wavUploaded = false;
   bool dataUploaded = false;
   if (WiFi.status() != WL_CONNECTED) {
@@ -637,11 +699,12 @@ void recordSession() {
   logMsg("  Rate:     " + String(actualSampleRate) + " Hz");
   logMsg("  Duration: " + String(recordDuration / 1000) + "s wall-clock");
   logMsg("  Writes:   " + String(writeCount) + " | Errors: " + String(writeErrors));
-  logMsg("  Size:     " + String(totalBytes / 1024) + " KB");
+  logMsg("  Size:     " + String(totalBytes) + " bytes (" + String(totalBytes / 1024) + " KB)");
   logMsg("  Temp:     " + String(avgTemp, 2) + " C");
   logMsg("  Humid:    " + String(avgHum, 2) + " %");
   logMsg("  Cloud:    WAV " + String(wavUploaded ? "OK" : "FAIL") +
          " | Data " + String(dataUploaded ? "OK" : "FAIL"));
+  logMsg("  Heap:     " + String(ESP.getFreeHeap()) + " bytes free");
   logMsg("=============================");
 }
 
@@ -692,7 +755,6 @@ void setup() {
   }
 
   // --- WiFi (station mode) ---
-  secureClient.setInsecure();
   if (connectWiFi()) {
     syncNTP();
   }
@@ -744,9 +806,9 @@ void loop() {
   // --- Ensure WiFi + NTP before recording ---
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
-    if (!ntpSynced && WiFi.status() == WL_CONNECTED) {
-      syncNTP();
-    }
+  }
+  if (!ntpSynced && WiFi.status() == WL_CONNECTED) {
+    syncNTP();
   }
 
   recordSession();

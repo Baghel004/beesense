@@ -24,11 +24,12 @@ function prepareData(readings: SensorReading[]) {
   return [...readings]
     .sort(
       (a, b) =>
-        new Date(a.timestamp.replace(" ", "T")).getTime() -
-        new Date(b.timestamp.replace(" ", "T")).getTime()
+        new Date((a.stored_at || a.timestamp).replace(" ", "T")).getTime() -
+        new Date((b.stored_at || b.timestamp).replace(" ", "T")).getTime()
     )
     .map((r) => {
-      const d = new Date(r.timestamp.replace(" ", "T"));
+      const ts = r.stored_at || r.timestamp;
+      const d = new Date(ts.replace(" ", "T"));
       return {
         time: d.toLocaleTimeString("en-IN", {
           hour: "2-digit",
