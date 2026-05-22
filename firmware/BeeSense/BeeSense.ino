@@ -921,6 +921,7 @@ void loop() {
     logMsg("=========================================");
 
     unsigned long lastCountdown = waitMin + 1;
+    unsigned long lastLogUpload = 0;
 
     while ((millis() - cycleStart) < intervalMs) {
       unsigned long remaining = intervalMs - (millis() - cycleStart);
@@ -938,6 +939,12 @@ void loop() {
       // Reconnect WiFi if it dropped during the wait
       if (WiFi.status() != WL_CONNECTED) {
         connectWiFi();
+      }
+
+      // Upload logs to cloud every 30 seconds for live dashboard view
+      if (WiFi.status() == WL_CONNECTED && (millis() - lastLogUpload) >= 30000) {
+        uploadLogs();
+        lastLogUpload = millis();
       }
 
       delay(5000);
