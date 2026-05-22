@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -180,29 +181,31 @@ function BulkDownloadSection({
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
 
-  async function downloadAll() {
+  async function downloadAllZip() {
     if (!files.length || downloading) return;
     setDownloading(true);
     setProgress({ done: 0, total: files.length });
 
+    const zip = new JSZip();
+
     for (let i = 0; i < files.length; i++) {
       try {
-        const url = getDownloadUrl(files[i].key);
-        const res = await fetch(url);
+        const res = await fetch(getDownloadUrl(files[i].key));
         const blob = await res.blob();
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = files[i].name;
-        a.click();
-        URL.revokeObjectURL(a.href);
+        zip.file(files[i].name, blob);
       } catch {
-        // continue with next file
+        // skip failed files
       }
       setProgress({ done: i + 1, total: files.length });
-      // small delay to avoid browser download throttling
-      await new Promise((r) => setTimeout(r, 500));
     }
 
+    const zipBlob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "beesense-recordings.zip";
+    a.click();
+    URL.revokeObjectURL(url);
     setDownloading(false);
   }
 
@@ -210,18 +213,14 @@ function BulkDownloadSection({
 
   return (
     <div className="flex items-center gap-4">
-      <Button
-        variant="outline"
-        onClick={downloadAll}
-        disabled={downloading}
-      >
+      <Button onClick={downloadAllZip} disabled={downloading}>
         {downloading
-          ? `Downloading ${progress.done}/${progress.total}...`
-          : `Download All ${files.length} Recordings`}
+          ? `Zipping ${progress.done}/${progress.total}...`
+          : `Download All as ZIP (${files.length} files)`}
       </Button>
       {downloading && (
         <span className="text-sm text-muted-foreground">
-          Files will save to your Downloads folder
+          Fetching files and building ZIP...
         </span>
       )}
     </div>

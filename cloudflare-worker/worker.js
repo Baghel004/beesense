@@ -19,8 +19,8 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Auth: require API key for uploads (PUT/POST)
-    if (request.method === "PUT" || request.method === "POST") {
+    // Auth: require API key for write operations
+    if (request.method === "PUT" || request.method === "POST" || request.method === "DELETE") {
       const auth = request.headers.get("Authorization");
       if (auth !== `Bearer ${env.API_KEY}`) {
         return json({ error: "Unauthorized" }, 401, corsHeaders);
@@ -161,6 +161,50 @@ export default {
         return json(allFiles, 200, corsHeaders);
       }
 
+      // POST /api/logs — store device logs
+      if (path === "/api/logs" && request.method === "POST") {
+        const data = await request.json();
+        const deviceId = data.device_id || "unknown";
+        const key = `logs/${deviceId}/current.json`;
+
+        const existing = await env.BUCKET.get(key);
+        let logs = [];
+        if (existing) {
+          try { logs = JSON.parse(await existing.text()); } catch {}
+        }
+
+        const newEntries = (data.lines || []).map((line) => ({
+          msg: line,
+          ts: new Date().toISOString(),
+        }));
+        logs = [...logs, ...newEntries].slice(-500);
+
+        await env.BUCKET.put(key, JSON.stringify(logs), {
+          httpMetadata: { contentType: "application/json" },
+        });
+
+        return json({ ok: true, count: logs.length }, 201, corsHeaders);
+      }
+
+      // GET /api/logs?device=<id> — get device logs
+      if (path === "/api/logs" && request.method === "GET") {
+        const deviceId = url.searchParams.get("device") || "beesense-01";
+        const key = `logs/${deviceId}/current.json`;
+
+        const obj = await env.BUCKET.get(key);
+        if (!obj) return json([], 200, corsHeaders);
+
+        const logs = JSON.parse(await obj.text());
+        return json(logs, 200, corsHeaders);
+      }
+
+      // DELETE /api/logs?device=<id> — clear device logs
+      if (path === "/api/logs" && request.method === "DELETE") {
+        const deviceId = url.searchParams.get("device") || "beesense-01";
+        await env.BUCKET.delete(`logs/${deviceId}/current.json`);
+        return json({ ok: true, cleared: true }, 200, corsHeaders);
+      }
+
       // GET /api/health — check if API is up (for dashboard)
       if (path === "/api/health") {
         return json({ ok: true, service: "beesense-api", time: new Date().toISOString() }, 200, corsHeaders);
@@ -179,6 +223,9 @@ export default {
             "GET /api/export/csv?device=:id": "Export all sensor data as CSV",
             "GET /api/export/json?device=:id": "Export all sensor data as JSON",
             "GET /api/download/:key": "Download a file",
+            "POST /api/logs": "Store device logs",
+            "GET /api/logs?device=:id": "Get device logs",
+            "DELETE /api/logs?device=:id": "Clear device logs",
             "GET /api/health": "Health check",
           },
         }, 200, corsHeaders);

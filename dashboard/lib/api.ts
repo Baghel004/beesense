@@ -1,5 +1,6 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 const DEVICE_ID = process.env.NEXT_PUBLIC_DEVICE_ID ?? "beesense-01";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "";
 
 export interface SensorReading {
   device_id: string;
@@ -68,6 +69,22 @@ export function getExportCsvUrl(): string {
 
 export function getExportJsonUrl(): string {
   return `${API_URL}/api/export/json?device=${DEVICE_ID}`;
+}
+
+export interface LogEntry {
+  msg: string;
+  ts: string;
+}
+
+export async function fetchLogs(): Promise<LogEntry[]> {
+  return apiFetch(`/api/logs?device=${DEVICE_ID}`);
+}
+
+export async function clearLogs(): Promise<void> {
+  await fetch(`${API_URL}/api/logs?device=${DEVICE_ID}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${API_KEY}` },
+  });
 }
 
 export function formatBytes(bytes: number): string {

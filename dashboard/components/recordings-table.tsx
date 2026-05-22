@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import JSZip from "jszip";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,6 +24,7 @@ interface RecordingsTableProps {
 export function RecordingsTable({ files, loading, limit }: RecordingsTableProps) {
   const [playing, setPlaying] = useState<string | null>(null);
   const [audio, setAudio] = useState<HTMLAudioElement | null>(null);
+  const [zipProgress, setZipProgress] = useState<{ done: number; total: number } | null>(null);
 
   const sorted = [...files].sort(
     (a, b) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
@@ -48,6 +50,35 @@ export function RecordingsTable({ files, loading, limit }: RecordingsTableProps)
     setAudio(a);
   }
 
+  async function handleDownloadAll() {
+    if (zipProgress || !files.length) return;
+
+    const allFiles = sorted;
+    setZipProgress({ done: 0, total: allFiles.length });
+
+    const zip = new JSZip();
+
+    for (let i = 0; i < allFiles.length; i++) {
+      try {
+        const res = await fetch(getDownloadUrl(allFiles[i].key));
+        const blob = await res.blob();
+        zip.file(allFiles[i].name, blob);
+      } catch {
+        // skip failed files
+      }
+      setZipProgress({ done: i + 1, total: allFiles.length });
+    }
+
+    const zipBlob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "beesense-recordings.zip";
+    a.click();
+    URL.revokeObjectURL(url);
+    setZipProgress(null);
+  }
+
   function formatDate(dateStr: string) {
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return dateStr;
@@ -64,8 +95,20 @@ export function RecordingsTable({ files, loading, limit }: RecordingsTableProps)
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">
-          {limit ? "Recent Recordings" : `All Recordings (${files.length})`}
+        <CardTitle className="flex items-center justify-between text-base">
+          <span>{limit ? "Recent Recordings" : `All Recordings (${files.length})`}</span>
+          {!limit && !loading && files.length > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleDownloadAll}
+              disabled={!!zipProgress}
+            >
+              {zipProgress
+                ? `Zipping ${zipProgress.done}/${zipProgress.total}...`
+                : `Download All as ZIP`}
+            </Button>
+          )}
         </CardTitle>
       </CardHeader>
       <CardContent>

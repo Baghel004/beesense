@@ -71,6 +71,8 @@ String logBuffer[LOG_BUFFER_SIZE];
 int logHead = 0;
 int logCount = 0;
 
+int lastWavHttpCode = 0;  // stored so summary can show it
+
 // Status for web dashboard
 String statusState = "BOOTING";
 String lastRecFile = "-";
@@ -187,47 +189,51 @@ bool connectWiFi() {
 //  CLOUD UPLOAD (Cloudflare R2 via Worker)
 // ============================================
 bool uploadWAVToCloud(String filePath) {
+  lastWavHttpCode = 0;
+
   if (WiFi.status() != WL_CONNECTED) {
-    logMsg("[CLOUD] No WiFi, skipping WAV upload.");
+    lastWavHttpCode = -100;
+    logMsg("[CLOUD] WAV skip: no WiFi");
     return false;
   }
 
   File wavFile = SD.open(filePath.c_str(), FILE_READ);
   if (!wavFile) {
-    logMsg("[CLOUD] Cannot open " + filePath);
+    lastWavHttpCode = -101;
+    logMsg("[CLOUD] WAV skip: can't open file");
     return false;
   }
 
   size_t fileSize = wavFile.size();
-  logMsg("[CLOUD] File on SD: " + String(fileSize) + " bytes");
-
   if (fileSize <= 44) {
-    logMsg("[CLOUD] File too small (header only?), skipping.");
+    lastWavHttpCode = -102;
     wavFile.close();
     return false;
   }
 
-  uint32_t freeHeap = ESP.getFreeHeap();
-  logMsg("[CLOUD] Free heap: " + String(freeHeap) + " bytes");
-  if (freeHeap < 60000) {
-    logMsg("[CLOUD] Not enough memory for TLS upload, skipping.");
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < 60000) {
+    lastWavHttpCode = -103;
+    logMsg("[CLOUD] WAV skip: heap " + String(heap));
     wavFile.close();
     return false;
   }
 
   String filename = filePath;
   if (filename.startsWith("/")) filename = filename.substring(1);
-
   String url = String(API_ENDPOINT) + "/api/upload/" + filename;
+
+  logMsg("[CLOUD] WAV upload: " + String(fileSize) + "B heap:" +
+         String(heap) + " RSSI:" + String(WiFi.RSSI()));
 
   WiFiClientSecure *client = new WiFiClientSecure();
   if (!client) {
-    logMsg("[CLOUD] TLS client alloc failed.");
+    lastWavHttpCode = -104;
     wavFile.close();
     return false;
   }
   client->setInsecure();
-  client->setTimeout(30);
+  client->setTimeout(120);
 
   HTTPClient http;
   http.begin(*client, url);
@@ -236,37 +242,33 @@ bool uploadWAVToCloud(String filePath) {
   http.addHeader("X-Device-Id", String(DEVICE_ID));
   http.setTimeout(120000);
 
-  logMsg("[CLOUD] Uploading " + filename + " (" + String(fileSize) + " bytes)...");
-
   int httpCode = http.sendRequest("PUT", &wavFile, fileSize);
+  lastWavHttpCode = httpCode;
+
+  logMsg("[CLOUD] WAV HTTP " + String(httpCode));
 
   wavFile.close();
   http.end();
   client->stop();
   delete client;
 
-  logMsg("[CLOUD] Free heap after upload: " + String(ESP.getFreeHeap()));
-
-  if (httpCode == 200 || httpCode == 201) {
-    logMsg("[CLOUD] WAV upload OK (" + String(httpCode) + ").");
-    return true;
-  }
-
-  logMsg("[CLOUD] WAV upload failed: HTTP " + String(httpCode));
-  return false;
+  return (httpCode == 200 || httpCode == 201);
 }
 
 bool uploadSensorData(String timestamp, float temp, float humidity,
                       String wavFile, uint32_t sampleRate) {
+  logMsg("[CLOUD] === Sensor Upload Start ===");
+  logMsg("[CLOUD] WiFi: " + String(WiFi.status()) +
+         " | RSSI: " + String(WiFi.RSSI()) + " dBm" +
+         " | Heap: " + String(ESP.getFreeHeap()));
+
   if (WiFi.status() != WL_CONNECTED) {
-    logMsg("[CLOUD] No WiFi, skipping data upload.");
+    logMsg("[CLOUD] No WiFi, skipping sensor upload.");
     return false;
   }
 
-  uint32_t freeHeap = ESP.getFreeHeap();
-  logMsg("[CLOUD] Sensor upload — heap: " + String(freeHeap));
-  if (freeHeap < 50000) {
-    logMsg("[CLOUD] Low memory, skipping sensor upload.");
+  if (ESP.getFreeHeap() < 50000) {
+    logMsg("[CLOUD] Low heap, skipping sensor upload.");
     return false;
   }
 
@@ -276,13 +278,13 @@ bool uploadSensorData(String timestamp, float temp, float humidity,
     return false;
   }
   client->setInsecure();
-  client->setTimeout(15);
+  client->setTimeout(30);
 
   HTTPClient http;
   http.begin(*client, String(API_ENDPOINT) + "/api/sensor-data");
   http.addHeader("Authorization", "Bearer " + String(API_KEY));
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(15000);
+  http.setTimeout(30000);
 
   String json = "{";
   json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
@@ -293,19 +295,64 @@ bool uploadSensorData(String timestamp, float temp, float humidity,
   json += "\"sample_rate\":" + String(sampleRate);
   json += "}";
 
+  logMsg("[CLOUD] POST sensor data...");
+  unsigned long start = millis();
+
   int httpCode = http.POST(json);
+
+  unsigned long elapsed = millis() - start;
+  logMsg("[CLOUD] Response: HTTP " + String(httpCode) + " in " + String(elapsed / 1000) + "s");
+
+  if (httpCode > 0) {
+    String body = http.getString();
+    logMsg("[CLOUD] Body: " + body.substring(0, 200));
+  }
 
   http.end();
   client->stop();
   delete client;
 
   if (httpCode == 200 || httpCode == 201) {
-    logMsg("[CLOUD] Sensor data uploaded.");
+    logMsg("[CLOUD] Sensor data OK.");
     return true;
   }
 
-  logMsg("[CLOUD] Sensor data failed: HTTP " + String(httpCode));
+  logMsg("[CLOUD] Sensor upload FAILED (HTTP " + String(httpCode) + ")");
   return false;
+}
+
+void uploadLogs() {
+  if (WiFi.status() != WL_CONNECTED || logCount == 0) return;
+  if (ESP.getFreeHeap() < 50000) return;
+
+  WiFiClientSecure *client = new WiFiClientSecure();
+  if (!client) return;
+  client->setInsecure();
+  client->setTimeout(15);
+
+  HTTPClient http;
+  http.begin(*client, String(API_ENDPOINT) + "/api/logs");
+  http.addHeader("Authorization", "Bearer " + String(API_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+
+  String json = "{\"device_id\":\"" + String(DEVICE_ID) + "\",\"lines\":[";
+  int start = (logCount < LOG_BUFFER_SIZE) ? 0 : logHead;
+  int count = min(logCount, LOG_BUFFER_SIZE);
+  for (int i = 0; i < count; i++) {
+    int idx = (start + i) % LOG_BUFFER_SIZE;
+    if (i > 0) json += ",";
+    String escaped = logBuffer[idx];
+    escaped.replace("\\", "\\\\");
+    escaped.replace("\"", "\\\"");
+    json += "\"" + escaped + "\"";
+  }
+  json += "]}";
+
+  http.POST(json);
+  http.end();
+  client->stop();
+  delete client;
 }
 
 // ============================================
@@ -360,49 +407,71 @@ void i2sStop() {
 // ============================================
 bool sdInitialized = false;
 
-// Send 80+ dummy clock pulses with CS HIGH — required by SD spec
-// to bring card from any unknown state to SPI mode ready
-void sdClockReset() {
+void sdClockPulses() {
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
+  delay(200);
+
   SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < 40; i++) {
     SPI.transfer(0xFF);
   }
   SPI.endTransaction();
-  delay(50);
+  delay(100);
 }
 
 bool initSD() {
-  logMsg("[SD] Starting init sequence...");
+  logMsg("[SD] ========== INIT START ==========");
+  logMsg("[SD] Heap: " + String(ESP.getFreeHeap()));
 
-  uint32_t speeds[] = {4000000, 2000000, 1000000};
+  // Try each speed with multiple clean attempts
+  // No manual CMD0 — let SD.begin() handle the full init sequence cleanly
+  uint32_t speeds[] = {4000000, 2000000, 1000000, 400000};
+  const char* speedLabels[] = {"4 MHz", "2 MHz", "1 MHz", "400 kHz"};
 
-  for (int s = 0; s < 3; s++) {
-    logMsg("[SD] Speed: " + String(speeds[s] / 1000000) + " MHz");
+  for (int s = 0; s < 4; s++) {
+    logMsg("[SD] --- Speed: " + String(speedLabels[s]) + " ---");
 
-    for (int a = 1; a <= 7; a++) {
-      // Full reset: tear down SPI, rebuild, send clock pulses
+    for (int a = 1; a <= 5; a++) {
+      // Full teardown
       SD.end();
       SPI.end();
-      delay(200);
+
+      // Force card state machine reset via CS toggle
+      pinMode(SD_CS, OUTPUT);
+      digitalWrite(SD_CS, LOW);
+      delay(50);
+      digitalWrite(SD_CS, HIGH);
+      delay(300 + a * 200);
+
+      // Set MISO pull-up before SPI takes the pin
+      pinMode(19, INPUT_PULLUP);
 
       SPI.begin(18, 19, 23, SD_CS);
-      sdClockReset();
+      sdClockPulses();
 
-      logMsg("[SD]   Attempt " + String(a) + "...");
+      logMsg("[SD] Attempt " + String(a) + "/5 at " + String(speedLabels[s]));
 
       if (SD.begin(SD_CS, SPI, speeds[s])) {
-        logMsg("[SD] OK at " + String(speeds[s] / 1000000) + " MHz (attempt " + String(a) + ").");
+        uint8_t cardType = SD.cardType();
+        String typeStr = "UNKNOWN";
+        if (cardType == CARD_MMC) typeStr = "MMC";
+        else if (cardType == CARD_SD) typeStr = "SD";
+        else if (cardType == CARD_SDHC) typeStr = "SDHC";
+        else if (cardType == CARD_NONE) typeStr = "NONE";
+        logMsg("[SD] OK at " + String(speedLabels[s]) +
+               " attempt " + String(a) + " | Type: " + typeStr +
+               " | Size: " + String((uint32_t)(SD.cardSize() / (1024 * 1024))) + " MB");
         sdInitialized = true;
+        logMsg("[SD] ========== INIT SUCCESS ==========");
         return true;
       }
 
-      delay(300 + a * 200);  // increasing delay between retries
+      logMsg("[SD] SD.begin() failed at " + String(speedLabels[s]));
     }
   }
 
-  logMsg("[SD] All attempts failed.");
+  logMsg("[SD] ========== INIT FAILED ==========");
   sdInitialized = false;
   return false;
 }
@@ -411,7 +480,7 @@ bool reinitSD() {
   logMsg("[SD] Reinitializing...");
   SD.end();
   SPI.end();
-  delay(500);
+  delay(1000);
   return initSD();
 }
 
@@ -687,7 +756,17 @@ void recordSession() {
     connectWiFi();
   }
   if (WiFi.status() == WL_CONNECTED) {
-    wavUploaded = uploadWAVToCloud(wavPath);
+    // WAV upload first (large file, needs clean heap)
+    for (int attempt = 1; attempt <= 2 && !wavUploaded; attempt++) {
+      if (attempt > 1) {
+        logMsg("[CLOUD] WAV retry...");
+        delay(3000);
+        if (WiFi.status() != WL_CONNECTED) connectWiFi();
+      }
+      wavUploaded = uploadWAVToCloud(wavPath);
+    }
+
+    // Sensor data (small JSON, always works)
     dataUploaded = uploadSensorData(ts, avgTemp, avgHum, wavPath, actualSampleRate);
   } else {
     logMsg("[CLOUD] No WiFi. Data saved to SD card only.");
@@ -702,10 +781,13 @@ void recordSession() {
   logMsg("  Size:     " + String(totalBytes) + " bytes (" + String(totalBytes / 1024) + " KB)");
   logMsg("  Temp:     " + String(avgTemp, 2) + " C");
   logMsg("  Humid:    " + String(avgHum, 2) + " %");
-  logMsg("  Cloud:    WAV " + String(wavUploaded ? "OK" : "FAIL") +
+  logMsg("  Cloud:    WAV " + String(wavUploaded ? "OK" : ("FAIL(" + String(lastWavHttpCode) + ")")) +
          " | Data " + String(dataUploaded ? "OK" : "FAIL"));
   logMsg("  Heap:     " + String(ESP.getFreeHeap()) + " bytes free");
   logMsg("=============================");
+
+  // Upload logs to cloud so dashboard can see them
+  uploadLogs();
 }
 
 // ============================================
