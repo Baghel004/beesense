@@ -349,7 +349,8 @@ void uploadLogs() {
   }
   json += "]}";
 
-  http.POST(json);
+  int code = http.POST(json);
+  Serial.println("[LOGS] Upload: HTTP " + String(code) + " (" + String(count) + " lines)");
   http.end();
   client->stop();
   delete client;

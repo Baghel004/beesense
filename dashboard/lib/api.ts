@@ -1,6 +1,6 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
-const DEVICE_ID = process.env.NEXT_PUBLIC_DEVICE_ID ?? "beesense-01";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://beesense-api.beesense.workers.dev";
+const DEVICE_ID = process.env.NEXT_PUBLIC_DEVICE_ID || "beesense-01";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "beesense-secret-2026";
 
 export interface SensorReading {
   device_id: string;
